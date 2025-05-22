@@ -94,7 +94,7 @@ pub struct ProjectPanelSettingsContent {
     ///
     /// Default: true
     pub button: Option<bool>,
-    /// Whether to hide gitignore files in the project panel.
+    /// Whether to hide files specified in .gitignore from the project panel.
     ///
     /// Default: false
     pub hide_gitignore: Option<bool>,
