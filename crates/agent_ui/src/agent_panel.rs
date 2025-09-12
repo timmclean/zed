@@ -6,13 +6,15 @@ use std::time::Duration;
 
 use acp_thread::AcpThread;
 use agent2::{DbThreadMetadata, HistoryEntry};
+use collections::HashMap;
 use db::kvp::{Dismissable, KEY_VALUE_STORE};
 use project::agent_server_store::{
     AgentServerCommand, AllAgentServersSettings, CLAUDE_CODE_NAME, GEMINI_NAME,
 };
 use serde::{Deserialize, Serialize};
+use text::OffsetRangeExt;
 use zed_actions::OpenBrowser;
-use zed_actions::agent::{Chat, OpenClaudeCodeOnboardingModal, ReauthenticateAgent};
+use zed_actions::agent::{OpenClaudeCodeOnboardingModal, ReauthenticateAgent};
 
 use crate::acp::{AcpThreadHistory, ThreadHistoryEvent};
 use crate::agent_diff::AgentDiffThread;
@@ -47,7 +49,7 @@ use agent::{
 };
 use agent_settings::{AgentDockPosition, AgentSettings, CompletionMode, DefaultView};
 use ai_onboarding::AgentPanelOnboarding;
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use assistant_context::{AssistantContext, ContextEvent, ContextSummary};
 use assistant_slash_command::SlashCommandWorkingSet;
 use assistant_tool::ToolWorkingSet;
@@ -63,7 +65,7 @@ use gpui::{
 };
 use language::LanguageRegistry;
 use language_model::{ConfigurationError, ConfiguredModel, LanguageModelRegistry};
-use project::{DisableAiSettings, Project, ProjectPath, Worktree};
+use project::{DisableAiSettings, Project, ProjectItem, ProjectPath, Worktree};
 use prompt_store::{PromptBuilder, PromptStore, UserPromptId};
 use rules_library::{RulesLibrary, open_rules_library};
 use search::{BufferSearchBar, buffer_search};
@@ -75,7 +77,7 @@ use ui::{
     Banner, Callout, ContextMenu, ContextMenuEntry, ElevationIndex, KeyBinding, PopoverMenu,
     PopoverMenuHandle, ProgressBar, Tab, Tooltip, prelude::*,
 };
-use util::{ResultExt as _, maybe};
+use util::ResultExt as _;
 use workspace::{
     CollaboratorId, DraggedSelection, DraggedTab, ToggleZoom, ToolbarItemView, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
@@ -1035,113 +1037,181 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(file_content) = std::fs::read_to_string(&action.file_path).log_err() else {
+        use agent_client_protocol as acp;
+
+        fn expand_prompt_template(
+            template: &str,
+            props: HashMap<String, Option<acp::ContentBlock>>,
+        ) -> anyhow::Result<Vec<acp::ContentBlock>> {
+            let mut result = vec![];
+            let mut text_block = String::new();
+            let mut chars = template.chars().peekable();
+
+            while let Some(ch) = chars.next() {
+                if ch == '{' && chars.peek() == Some(&'{') {
+                    if !text_block.is_empty() {
+                        result.push(text_block.into());
+                        text_block = String::new();
+                    }
+
+                    chars.next(); // consume the second '{'
+                    let mut prop_name = String::new();
+                    while let Some(ch) = chars.next() {
+                        if ch == '}' && chars.peek() == Some(&'}') {
+                            chars.next(); // consume the second '}'
+                            break;
+                        }
+                        prop_name.push(ch);
+                    }
+                    let prop_name = prop_name.trim();
+                    if let Some(value) = props.get(prop_name) {
+                        if let Some(value) = value {
+                            result.push(value.to_owned());
+                        } else {
+                            bail!("prompt template references unavailable property '{prop_name}'");
+                        }
+                    } else {
+                        bail!("prompt template references unknown property '{prop_name}'");
+                    }
+                } else {
+                    text_block.push(ch);
+                }
+            }
+
+            if !text_block.is_empty() {
+                result.push(text_block.into());
+            }
+
+            Ok(result)
+        }
+
+        let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
 
-        let thread = self
-            .thread_store
-            .update(cx, |this, cx| this.create_thread(cx));
+        let Some(prompt_template) = std::fs::read_to_string(&action.file_path).log_err() else {
+            return;
+        };
 
-        let context_store = cx.new(|_cx| {
-            ContextStore::new(
-                self.project.downgrade(),
-                Some(self.thread_store.downgrade()),
-            )
-        });
+        self.external_thread(
+            Some(crate::ExternalAgent::NativeAgent),
+            None,
+            None,
+            window,
+            cx,
+        );
 
-        let active_thread = cx.new(|cx| {
-            ActiveThread::new(
-                thread.clone(),
-                self.thread_store.clone(),
-                self.context_store.clone(),
-                context_store.clone(),
-                self.language_registry.clone(),
-                self.workspace.clone(),
-                window,
-                cx,
-            )
-        });
+        cx.spawn_in(window, async move |panel, cx| {
+            let Some(panel) = panel.upgrade() else {
+                return Ok(());
+            };
 
-        let message_editor = cx.new(|cx| {
-            MessageEditor::new(
-                self.fs.clone(),
-                self.workspace.clone(),
-                context_store.clone(),
-                self.prompt_store.clone(),
-                self.thread_store.downgrade(),
-                self.context_store.downgrade(),
-                Some(self.history_store.downgrade()),
-                thread.clone(),
-                window,
-                cx,
-            )
-        });
+            let prompt = cx.update(|_window, cx| {
+                let selections = crate::context_picker::selection_ranges(&workspace, cx);
+                let selection = selections.get(0);
 
-        message_editor.update(cx, |editor, cx| {
-            editor.set_text(file_content, window, cx);
-        });
+                expand_prompt_template(
+                    &prompt_template,
+                    [
+                        ("selection".to_owned(), {
+                            selection.map(|(buffer, range)| {
+                                let snapshot = buffer.read(cx).snapshot();
+                                let text =
+                                    snapshot.text_for_range(range.clone()).collect::<String>();
+                                let abs_path =
+                                    buffer.read(cx).project_path(cx).and_then(|project_path| {
+                                        workspace
+                                            .read(cx)
+                                            .project()
+                                            .read(cx)
+                                            .absolute_path(&project_path, cx)
+                                    });
+                                let point_range = range.to_point(&snapshot);
+                                let line_range = point_range.start.row..=point_range.end.row;
 
-        message_editor.focus_handle(cx).focus(window);
-
-        let thread_view = ActiveView::thread(active_thread, message_editor.clone(), window, cx);
-        self.set_active_view(thread_view, window, cx);
-
-        AgentDiff::set_active_thread(&self.workspace, thread.clone(), window, cx);
-
-        if let Some(workspace) = self.workspace.upgrade() {
-            window.defer(cx, move |window, cx| {
-                workspace.update(cx, |workspace, cx| {
-                    let Some(agent_panel_delegate) = <dyn AgentPanelDelegate>::try_global(cx)
-                    else {
-                        return;
-                    };
-
-                    let Some((selections, buffer)) = maybe!({
-                        let editor = workspace
-                            .active_item(cx)
-                            .and_then(|item| item.act_as::<Editor>(cx))?;
-
-                        let buffer = editor.read(cx).buffer().clone();
-                        let snapshot = buffer.read(cx).snapshot(cx);
-                        let selections = editor.update(cx, |editor, cx| {
-                            editor
-                                .selections
-                                .all_adjusted(cx)
-                                .into_iter()
-                                .filter_map(|s| {
-                                    (!s.is_empty()).then(|| {
-                                        snapshot.anchor_after(s.start)
-                                            ..snapshot.anchor_before(s.end)
-                                    })
+                                acp::ContentBlock::Resource(acp::EmbeddedResource {
+                                    annotations: None,
+                                    resource: acp::EmbeddedResourceResource::TextResourceContents(
+                                        acp::TextResourceContents {
+                                            mime_type: None,
+                                            text,
+                                            uri: acp_thread::MentionUri::Selection {
+                                                abs_path,
+                                                line_range,
+                                            }
+                                            .to_uri()
+                                            .to_string(),
+                                        },
+                                    ),
                                 })
-                                .collect::<Vec<_>>()
-                        });
-                        Some((selections, buffer))
-                    }) else {
-                        return;
-                    };
+                            })
+                        }),
+                        ("current_file".to_owned(), {
+                            selection.and_then(|(buffer, range)| {
+                                let snapshot = buffer.read(cx).snapshot();
+                                let text =
+                                    snapshot.text_for_range(range.clone()).collect::<String>();
+                                let Some(abs_path) =
+                                    buffer.read(cx).project_path(cx).and_then(|project_path| {
+                                        workspace
+                                            .read(cx)
+                                            .project()
+                                            .read(cx)
+                                            .absolute_path(&project_path, cx)
+                                    })
+                                else {
+                                    return None;
+                                };
 
-                    if selections.is_empty() {
-                        return;
-                    }
+                                Some(acp::ContentBlock::Resource(acp::EmbeddedResource {
+                                    annotations: None,
+                                    resource: acp::EmbeddedResourceResource::TextResourceContents(
+                                        acp::TextResourceContents {
+                                            mime_type: None,
+                                            text,
+                                            uri: acp_thread::MentionUri::File { abs_path }
+                                                .to_uri()
+                                                .to_string(),
+                                        },
+                                    ),
+                                }))
+                            })
+                        }),
+                    ]
+                    .into_iter()
+                    .collect(),
+                )
+            })??;
 
-                    agent_panel_delegate.quote_selection(workspace, selections, buffer, window, cx);
+            // Wait for new thread view to become active
+            cx.background_executor()
+                .timer(Duration::from_millis(100))
+                .await;
+
+            let Some(thread_view) =
+                panel.read_with(cx, |panel, _| panel.active_thread_view().cloned())?
+            else {
+                return Ok(());
+            };
+
+            cx.update(|window, cx| {
+                thread_view.update(cx, |thread_view, cx| {
+                    thread_view.set_message(prompt, window, cx);
                 });
+            })?;
 
-                cx.spawn(async move |cx| {
-                    cx.background_executor()
-                        .timer(Duration::from_millis(100))
-                        .await;
+            // Wait for message editor content to get updated
+            cx.background_executor()
+                .timer(Duration::from_millis(100))
+                .await;
 
-                    cx.update(|app| {
-                        app.dispatch_action(&Chat);
-                    })
-                    .unwrap();
-                })
-                .detach();
-            });
-        }
+            cx.update(|window, cx| {
+                thread_view.update(cx, |thread_view, cx| {
+                    thread_view.send(window, cx);
+                });
+            })
+        })
+        .detach_and_log_err(cx);
     }
 
     fn new_native_agent_thread_from_summary(

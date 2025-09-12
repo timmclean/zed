@@ -992,7 +992,18 @@ impl AcpThreadView {
         .detach();
     }
 
-    fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn set_message(
+        &mut self,
+        message: Vec<acp::ContentBlock>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.message_editor.update(cx, |message_editor, cx| {
+            message_editor.set_message(message, window, cx);
+        });
+    }
+
+    pub fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(thread) = self.thread() else { return };
 
         if self.is_loading_contents {
