@@ -168,6 +168,14 @@ pub struct NewNativeAgentThreadFromSummary {
     from_session_id: agent_client_protocol::SessionId,
 }
 
+/// Creates a new conversation thread, and immediately sends a message to the agent in that thread using the specified file and the current selection.
+#[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = agent)]
+#[serde(deny_unknown_fields)]
+pub struct NewThreadFromPromptFile {
+    file_path: String,
+}
+
 // TODO unify this with AgentType
 #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
