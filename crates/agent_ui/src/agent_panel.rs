@@ -12,7 +12,7 @@ use project::agent_server_store::{
 };
 use serde::{Deserialize, Serialize};
 use zed_actions::OpenBrowser;
-use zed_actions::agent::{OpenClaudeCodeOnboardingModal, ReauthenticateAgent};
+use zed_actions::agent::{Chat, OpenClaudeCodeOnboardingModal, ReauthenticateAgent};
 
 use crate::acp::{AcpThreadHistory, ThreadHistoryEvent};
 use crate::agent_diff::AgentDiffThread;
@@ -36,7 +36,8 @@ use crate::{
     ui::{AgentOnboardingModal, EndTrialUpsell},
 };
 use crate::{
-    ExternalAgent, NewExternalAgentThread, NewNativeAgentThreadFromSummary, placeholder_command,
+    ExternalAgent, NewExternalAgentThread, NewNativeAgentThreadFromSummary,
+    NewThreadFromPromptFile, placeholder_command,
 };
 use agent::{
     Thread, ThreadError, ThreadEvent, ThreadId, ThreadSummary, TokenUsageRatio,
@@ -74,7 +75,7 @@ use ui::{
     Banner, Callout, ContextMenu, ContextMenuEntry, ElevationIndex, KeyBinding, PopoverMenu,
     PopoverMenuHandle, ProgressBar, Tab, Tooltip, prelude::*,
 };
-use util::ResultExt as _;
+use util::{ResultExt as _, maybe};
 use workspace::{
     CollaboratorId, DraggedSelection, DraggedTab, ToggleZoom, ToolbarItemView, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
@@ -116,6 +117,14 @@ pub fn init(cx: &mut App) {
                         }
                     },
                 )
+                .register_action(|workspace, action: &NewThreadFromPromptFile, window, cx| {
+                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                        panel.update(cx, |panel, cx| {
+                            panel.new_thread_from_prompt_file(action, window, cx)
+                        });
+                        workspace.focus_panel::<AgentPanel>(window, cx);
+                    }
+                })
                 .register_action(|workspace, _: &OpenHistory, window, cx| {
                     if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
                         workspace.focus_panel::<AgentPanel>(window, cx);
@@ -1018,6 +1027,121 @@ impl AgentPanel {
         self.set_active_view(thread_view, window, cx);
 
         AgentDiff::set_active_thread(&self.workspace, thread.clone(), window, cx);
+    }
+
+    fn new_thread_from_prompt_file(
+        &mut self,
+        action: &NewThreadFromPromptFile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(file_content) = std::fs::read_to_string(&action.file_path).log_err() else {
+            return;
+        };
+
+        let thread = self
+            .thread_store
+            .update(cx, |this, cx| this.create_thread(cx));
+
+        let context_store = cx.new(|_cx| {
+            ContextStore::new(
+                self.project.downgrade(),
+                Some(self.thread_store.downgrade()),
+            )
+        });
+
+        let active_thread = cx.new(|cx| {
+            ActiveThread::new(
+                thread.clone(),
+                self.thread_store.clone(),
+                self.context_store.clone(),
+                context_store.clone(),
+                self.language_registry.clone(),
+                self.workspace.clone(),
+                window,
+                cx,
+            )
+        });
+
+        let message_editor = cx.new(|cx| {
+            MessageEditor::new(
+                self.fs.clone(),
+                self.workspace.clone(),
+                context_store.clone(),
+                self.prompt_store.clone(),
+                self.thread_store.downgrade(),
+                self.context_store.downgrade(),
+                Some(self.history_store.downgrade()),
+                thread.clone(),
+                window,
+                cx,
+            )
+        });
+
+        message_editor.update(cx, |editor, cx| {
+            editor.set_text(file_content, window, cx);
+        });
+
+        message_editor.focus_handle(cx).focus(window);
+
+        let thread_view = ActiveView::thread(active_thread, message_editor.clone(), window, cx);
+        self.set_active_view(thread_view, window, cx);
+
+        AgentDiff::set_active_thread(&self.workspace, thread.clone(), window, cx);
+
+        if let Some(workspace) = self.workspace.upgrade() {
+            window.defer(cx, move |window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    let Some(agent_panel_delegate) = <dyn AgentPanelDelegate>::try_global(cx)
+                    else {
+                        return;
+                    };
+
+                    let Some((selections, buffer)) = maybe!({
+                        let editor = workspace
+                            .active_item(cx)
+                            .and_then(|item| item.act_as::<Editor>(cx))?;
+
+                        let buffer = editor.read(cx).buffer().clone();
+                        let snapshot = buffer.read(cx).snapshot(cx);
+                        let selections = editor.update(cx, |editor, cx| {
+                            editor
+                                .selections
+                                .all_adjusted(cx)
+                                .into_iter()
+                                .filter_map(|s| {
+                                    (!s.is_empty()).then(|| {
+                                        snapshot.anchor_after(s.start)
+                                            ..snapshot.anchor_before(s.end)
+                                    })
+                                })
+                                .collect::<Vec<_>>()
+                        });
+                        Some((selections, buffer))
+                    }) else {
+                        return;
+                    };
+
+                    if selections.is_empty() {
+                        return;
+                    }
+
+                    agent_panel_delegate.quote_selection(workspace, selections, buffer, window, cx);
+                });
+
+                cx.spawn(async move |cx| {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(100))
+                        .await;
+
+                    cx.update(|app| {
+                        app.dispatch_action(&Chat);
+                    })
+                    .unwrap();
+                })
+                .detach();
+            });
+        }
     }
 
     fn new_native_agent_thread_from_summary(
